@@ -388,6 +388,14 @@ void VoCoTypeAddon::updateUI(fcitx::InputContext* ic, const RimeUIState& state) 
         candidateList->setCursorPositionAfterPaging(
             fcitx::CursorPositionAfterPaging::ResetToFirst);
 
+        // 设置候选词选择键（数字 1-0）
+        candidateList->setSelectionKey({
+            fcitx::Key(FcitxKey_1), fcitx::Key(FcitxKey_2), fcitx::Key(FcitxKey_3),
+            fcitx::Key(FcitxKey_4), fcitx::Key(FcitxKey_5), fcitx::Key(FcitxKey_6),
+            fcitx::Key(FcitxKey_7), fcitx::Key(FcitxKey_8), fcitx::Key(FcitxKey_9),
+            fcitx::Key(FcitxKey_0)
+        });
+
         for (size_t i = 0; i < state.candidates.size(); ++i) {
             const auto& [text, comment] = state.candidates[i];
             fcitx::Text candidate_text;
