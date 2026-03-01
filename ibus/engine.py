@@ -189,6 +189,10 @@ class VoCoTypeEngine(IBus.Engine):
             if self._rime_session is not None:
                 return True
 
+            api = None
+            session_id = None
+            session = None
+            session_tracked = False
             try:
                 # 确保日志目录存在
                 log_dir = Path.home() / ".local" / "share" / "vocotype" / "rime"
@@ -248,10 +252,14 @@ class VoCoTypeEngine(IBus.Engine):
                             except OSError as e:
                                 logger.warning("创建 %s 符号链接失败: %s", subdir, e)
 
+                # 注意：pyrime 编译版本中 user_data_dir 和 log_dir 字段位置与 .pyi 存根相反。
+                # 实测：传入 user_data_dir 的值被 librime 用作 log_dir，
+                #       传入 log_dir 的值被 librime 用作 user_data_dir（读取 schema/build）。
+                # 因此这里交换两个字段，使 librime 能正确读取用户配置目录中的 schema 和 build。
                 traits = Traits(
                     shared_data_dir=str(shared_data_dir),
-                    user_data_dir=str(user_data_dir),
-                    log_dir=str(log_dir),
+                    user_data_dir=str(log_dir),      # pyrime bug: 此值实为 librime log_dir
+                    log_dir=str(user_data_dir),       # pyrime bug: 此值实为 librime user_data_dir
                     distribution_name="VoCoType",
                     distribution_code_name="vocotype",
                     distribution_version="1.0",
@@ -262,24 +270,24 @@ class VoCoTypeEngine(IBus.Engine):
                            shared_data_dir, user_data_dir, log_dir)
 
                 # 每个engine实例创建自己的session（避免共享状态问题）
+                # Traits.__post_init__ 已完成 setup+initialize，不重复调用
                 api = API()
-                logger.info("Rime API 创建 (addr=%s)，初始化中...", api.address)
-                api.setup(traits)
-                api.initialize(traits)
+                logger.info("Rime API 创建 (addr=%s)", api.address)
                 session_id = api.create_session()
 
                 # 跟踪活跃session（用于调试）
                 with self._session_lock:
                     self._active_sessions.add(session_id)
+                    session_tracked = True
                     logger.info("Session ID: %s created, active sessions: %d",
                                session_id, len(self._active_sessions))
 
                 # 创建 Session 对象
-                self._rime_session = Session(traits=traits, api=api, id=session_id)
+                session = Session(traits=traits, api=api, id=session_id)
 
                 # 获取当前schema（处理可能的编码问题）
                 try:
-                    schema = self._rime_session.get_current_schema()
+                    schema = session.get_current_schema()
                     # 如果返回的是字节串，尝试解码
                     if isinstance(schema, bytes):
                         try:
@@ -296,24 +304,36 @@ class VoCoTypeEngine(IBus.Engine):
                 if preferred_schema:
                     try:
                         logger.info("尝试使用用户配置的方案: %s", preferred_schema)
-                        self._rime_session.select_schema(preferred_schema)
+                        session.select_schema(preferred_schema)
                     except Exception as exc:
                         logger.warning("选择用户方案失败: %s", exc)
                 elif schema in (None, "", ".default"):
                     try:
                         logger.info("使用默认方案: %s", self.DEFAULT_RIME_SCHEMA)
-                        self._rime_session.select_schema(self.DEFAULT_RIME_SCHEMA)
+                        session.select_schema(self.DEFAULT_RIME_SCHEMA)
                     except Exception as exc:
                         logger.warning("选择默认方案失败: %s", exc)
 
                 try:
-                    logger.info("当前 schema: %s", self._rime_session.get_current_schema())
+                    logger.info("当前 schema: %s", session.get_current_schema())
                 except Exception:
                     pass
+                self._rime_session = session
                 return True
 
             except Exception as exc:
                 logger.error("初始化 Rime Session 失败: %s", exc)
+                if api is not None and session_id is not None:
+                    try:
+                        api.destroy_session(session_id)
+                    except Exception as cleanup_exc:
+                        logger.warning("清理失败的 Rime session 失败: %s", cleanup_exc)
+                if session_tracked and session_id is not None:
+                    with self._session_lock:
+                        self._active_sessions.discard(session_id)
+                        logger.info("Session ID: %s removed after init failure, active sessions: %d",
+                                   session_id, len(self._active_sessions))
+                self._rime_session = None
                 import traceback
                 traceback.print_exc()
                 self._rime_enabled = False  # Disable RIME on failure

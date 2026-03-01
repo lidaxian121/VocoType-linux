@@ -134,6 +134,9 @@ class RimeHandler:
             if self.session is not None:
                 return True
 
+            api = None
+            session_id = None
+            session = None
             try:
                 # 确保日志目录存在
                 log_dir = Path.home() / ".local" / "share" / "vocotype-fcitx5" / "rime"
@@ -176,32 +179,20 @@ class RimeHandler:
                     logger.error("找不到 Rime 配置文件（用户和系统目录都缺少 default.yaml）")
                     return False
 
-                # 仅在使用 vocotype 目录时创建符号链接
-                if user_data_dir == vocotype_user_dir:
-                    for subdir in ["build", "lua", "cn_dicts", "en_dicts", "opencc", "others"]:
-                        link_path = user_data_dir / subdir
-                        if link_path.exists() or link_path.is_symlink():
-                            continue
-                        target_path = fcitx5_user_dir / subdir
-                        if not target_path.exists():
-                            target_path = shared_data_dir / subdir
-                        if target_path.exists():
-                            try:
-                                link_path.symlink_to(target_path)
-                                logger.debug("创建 %s 符号链接: %s -> %s", subdir, link_path, target_path)
-                            except OSError as exc:
-                                logger.warning("创建 %s 符号链接失败: %s", subdir, exc)
-
                 install_meta = self._read_installation_metadata(user_data_dir)
                 distribution_name = install_meta.get("distribution_name") or "VoCoType-Fcitx5"
                 distribution_code = install_meta.get("distribution_code_name") or "vocotype-fcitx5"
                 distribution_version = install_meta.get("distribution_version") or "1.0"
                 app_name = "rime.fcitx5" if distribution_code == "fcitx-rime" else "rime.vocotype.fcitx5"
 
+                # 注意：pyrime 编译版本中 user_data_dir 和 log_dir 字段位置与 .pyi 存根相反。
+                # 实测：传入 user_data_dir 的值被 librime 用作 log_dir，
+                #       传入 log_dir 的值被 librime 用作 user_data_dir（读取 schema/build）。
+                # 因此这里交换两个字段，使 librime 能正确读取用户配置目录中的 schema 和 build。
                 traits = Traits(
                     shared_data_dir=str(shared_data_dir),
-                    user_data_dir=str(user_data_dir),
-                    log_dir=str(log_dir),
+                    user_data_dir=str(log_dir),      # pyrime bug: 此值实为 librime log_dir
+                    log_dir=str(user_data_dir),       # pyrime bug: 此值实为 librime user_data_dir
                     distribution_name=distribution_name,
                     distribution_code_name=distribution_code,
                     distribution_version=distribution_version,
@@ -213,18 +204,15 @@ class RimeHandler:
                 if install_meta:
                     logger.info("Rime installation metadata: %s", install_meta)
 
+                # Traits.__post_init__ 已完成 setup+initialize，不重复调用
                 api = API()
-                logger.info("Rime API 创建 (addr=%s)，初始化中...", api.address)
-                api.setup(traits)
-                api.initialize(traits)
+                logger.info("Rime API 创建 (addr=%s)", api.address)
                 session_id = api.create_session()
-                self._api = api
-                self._session_id = session_id
-                self.session = Session(traits=traits, api=api, id=session_id)
+                session = Session(traits=traits, api=api, id=session_id)
 
                 # 选择已部署的 schema（避免 get_schema_list 触发潜在崩溃）
                 try:
-                    schema = self.session.get_current_schema()
+                    schema = session.get_current_schema()
                     if isinstance(schema, bytes):
                         try:
                             schema = schema.decode("utf-8")
@@ -239,31 +227,43 @@ class RimeHandler:
                 if preferred_schema:
                     try:
                         logger.info("尝试使用用户配置的方案: %s", preferred_schema)
-                        self.session.select_schema(preferred_schema)
+                        session.select_schema(preferred_schema)
                     except Exception as exc:
                         logger.warning("选择用户方案失败: %s", exc)
                 elif schema in (None, "", ".default"):
                     try:
                         logger.info("使用默认方案: %s", self.DEFAULT_RIME_SCHEMA)
-                        self.session.select_schema(self.DEFAULT_RIME_SCHEMA)
+                        session.select_schema(self.DEFAULT_RIME_SCHEMA)
                     except Exception as exc:
                         logger.warning("选择默认方案失败: %s", exc)
 
                 try:
-                    logger.info("当前 schema: %s", self.session.get_current_schema())
+                    logger.info("当前 schema: %s", session.get_current_schema())
                 except Exception:
                     pass
 
                 try:
-                    if hasattr(self.session, "set_option"):
-                        self.session.set_option("ascii_mode", False)
+                    if hasattr(session, "set_option"):
+                        session.set_option("ascii_mode", False)
                         logger.info("已关闭 ascii_mode")
                 except Exception as exc:
                     logger.warning("设置 ascii_mode 失败: %s", exc)
+
+                self._api = api
+                self._session_id = session_id
+                self.session = session
                 return True
 
             except Exception as exc:
                 logger.error("初始化 Rime Session 失败: %s", exc)
+                if api is not None and session_id is not None:
+                    try:
+                        api.destroy_session(session_id)
+                    except Exception as cleanup_exc:
+                        logger.warning("清理失败的 Rime session 失败: %s", cleanup_exc)
+                self._api = None
+                self._session_id = None
+                self.session = None
                 import traceback
                 traceback.print_exc()
                 return False
@@ -316,26 +316,19 @@ class RimeHandler:
             # 获取上下文
             context = self.session.get_context()
             if context:
-                # 预编辑文本
-                preedit_text = context.composition.preedit or ""
-                if preedit_text:
-                    result["preedit"] = {
-                        "text": preedit_text,
-                        "cursor_pos": context.composition.cursor_pos
-                    }
-
                 # 候选词
-                menu = context.menu
-                if menu.candidates:
+                menu = getattr(context, "menu", None)
+                candidates = getattr(menu, "candidates", None) or []
+                if candidates:
                     result["candidates"] = [
                         {
-                            "text": c.text,
-                            "comment": c.comment or ""
+                            "text": getattr(c, "text", ""),
+                            "comment": getattr(c, "comment", "") or ""
                         }
-                        for c in menu.candidates
+                        for c in candidates
                     ]
-                    result["highlighted_index"] = menu.highlighted_candidate_index
-                    result["page_size"] = menu.page_size
+                    result["highlighted_index"] = getattr(menu, "highlighted_candidate_index", 0)
+                    result["page_size"] = getattr(menu, "page_size", 5)
 
             logger.info(
                 "Rime 状态: handled=%s, preedit=%s, candidates=%s, commit=%s",
@@ -364,13 +357,14 @@ class RimeHandler:
 
     def cleanup(self):
         """清理资源"""
-        if self.session:
+        had_resources = self._api is not None or self._session_id is not None or self.session is not None
+        if self._api and self._session_id is not None:
             try:
-                if self._api and self._session_id is not None:
-                    self._api.destroy_session(self._session_id)
-                self.session = None
-                self._api = None
-                self._session_id = None
-                logger.info("Rime Handler 已清理")
+                self._api.destroy_session(self._session_id)
             except Exception as exc:
                 logger.warning("清理 Rime Handler 失败: %s", exc)
+        self.session = None
+        self._api = None
+        self._session_id = None
+        if had_resources:
+            logger.info("Rime Handler 已清理")

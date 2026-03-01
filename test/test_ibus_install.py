@@ -9,12 +9,26 @@ import sys
 from pathlib import Path
 
 
+def _skip_unless_install_validation_enabled():
+    """这些用例用于安装后验证；默认在 pytest 中跳过。"""
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        return
+    if os.environ.get("VOCOTYPE_VALIDATE_INSTALL") == "1":
+        return
+    try:
+        import pytest
+        pytest.skip("安装验证测试默认跳过，设置 VOCOTYPE_VALIDATE_INSTALL=1 启用")
+    except ImportError:
+        pass
+
+
 def check_mark(ok: bool) -> str:
     return "✓" if ok else "✗"
 
 
 def test_directory_structure():
     """测试目录结构"""
+    _skip_unless_install_validation_enabled()
     print("\n[1] 检查目录结构...")
 
     home = Path.home()
@@ -40,11 +54,12 @@ def test_directory_structure():
     results.append(ok)
     print(f"  {check_mark(ok)} 启动脚本: {launcher}")
 
-    return all(results)
+    assert all(results), "目录结构检查失败"
 
 
 def test_python_deps():
     """测试 Python 依赖"""
+    _skip_unless_install_validation_enabled()
     print("\n[2] 检查 Python 依赖...")
 
     results = []
@@ -63,11 +78,12 @@ def test_python_deps():
         results.append(ok)
         print(f"  {check_mark(ok)} {name}")
 
-    return all(results)
+    assert all(results), "Python 依赖检查失败"
 
 
 def test_rime_integration():
     """测试 Rime 集成"""
+    _skip_unless_install_validation_enabled()
     print("\n[3] 检查 Rime 集成...")
 
     home = Path.home()
@@ -92,7 +108,7 @@ def test_rime_integration():
 
     if not pyrime_ok:
         print("  (跳过 Rime 相关测试)")
-        return True  # 纯语音版，不算失败
+        return  # 纯语音版，不算失败
 
     # 检查共享数据目录
     ok = shared_data_dir is not None
@@ -101,7 +117,7 @@ def test_rime_integration():
 
     if not ok:
         print("  ⚠ 请先安装 rime-data 共享数据")
-        return False
+        assert False, "缺少 rime-data 共享数据目录"
 
     # 优先使用 ibus-rime 配置目录
     if (ibus_rime / "default.yaml").exists():
@@ -118,11 +134,12 @@ def test_rime_integration():
         results.append(ok)
         print(f"  {check_mark(ok)} user.yaml: {user_yaml}")
 
-    return all(results)
+    assert all(results), "Rime 集成检查失败"
 
 
 def test_rime_functionality():
     """测试 Rime 功能"""
+    _skip_unless_install_validation_enabled()
     print("\n[4] 测试 Rime 功能...")
 
     try:
@@ -130,7 +147,7 @@ def test_rime_functionality():
         from pyrime.session import Session
     except ImportError:
         print("  (pyrime 未安装，跳过)")
-        return True
+        return
 
     home = Path.home()
     ibus_rime = home / ".config" / "ibus" / "rime"
@@ -142,7 +159,7 @@ def test_rime_functionality():
 
     if not user_data_dir.exists():
         print("  ⚠ VoCoType Rime 配置不存在")
-        return False
+        assert False, "VoCoType Rime 配置不存在"
 
     if not log_dir.exists():
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -153,7 +170,7 @@ def test_rime_functionality():
 
     if shared_data_dir is None:
         print("  ✗ 找不到 rime-data 目录")
-        return False
+        assert False, "找不到 rime-data 目录"
 
     results = []
 
@@ -171,7 +188,7 @@ def test_rime_functionality():
         results.append(True)
     except Exception as e:
         print(f"  ✗ Traits 创建失败: {e}")
-        return False
+        assert False, f"Traits 创建失败: {e}"
 
     try:
         api = API()
@@ -180,7 +197,7 @@ def test_rime_functionality():
         results.append(True)
     except Exception as e:
         print(f"  ✗ Session 创建失败: {e}")
-        return False
+        assert False, f"Session 创建失败: {e}"
 
     # 检查 schema
     schema = session.get_current_schema()
@@ -196,7 +213,7 @@ def test_rime_functionality():
 
     if not ok:
         print("  ⚠ Schema 列表为空，可能是符号链接配置问题")
-        return False
+        assert False, "Schema 列表为空"
 
     # 测试输入
     print("\n  测试输入 'ni'...")
@@ -222,11 +239,12 @@ def test_rime_functionality():
         print("  ✗ 无法获取上下文")
         results.append(False)
 
-    return all(results)
+    assert all(results), "Rime 功能检查失败"
 
 
 def test_ibus_component():
     """测试 IBus 组件"""
+    _skip_unless_install_validation_enabled()
     print("\n[5] 检查 IBus 组件...")
 
     home = Path.home()
@@ -250,7 +268,7 @@ def test_ibus_component():
         print(f"    检查位置: {component_paths}")
 
     results.append(found)
-    return all(results)
+    assert all(results), "IBus 组件检查失败"
 
 
 def main():
@@ -269,7 +287,11 @@ def main():
     results = []
     for name, test_func in tests:
         try:
-            ok = test_func()
+            test_func()
+            ok = True
+        except AssertionError as e:
+            print(f"\n  ✗ 断言失败: {e}")
+            ok = False
         except Exception as e:
             print(f"\n  ✗ 测试异常: {e}")
             ok = False
