@@ -20,6 +20,7 @@ namespace vocotype {
  */
 struct RimeUIState {
     bool handled = false;               // 按键是否被 Rime 处理
+    bool ascii_mode = false;            // 当前是否英文模式
     std::string commit_text;            // 提交的文本（如果有）
     std::string preedit_text;           // 预编辑文本
     int cursor_pos = 0;                 // 光标位置

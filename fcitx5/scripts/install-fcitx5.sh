@@ -163,8 +163,12 @@ cp "$HOME/.local/lib64/fcitx5/vocotype.so" "$HOME/.local/lib/fcitx5/" 2>/dev/nul
 cp "$PROJECT_DIR/fcitx5/addon/build/vocotype.so" "$HOME/.local/lib/fcitx5/"
 
 # 创建 lib 前缀的符号链接（兼容性）
-cd "$HOME/.local/lib64/fcitx5" && ln -sf vocotype.so libvocotype.so 2>/dev/null || true
-cd "$HOME/.local/lib/fcitx5" && ln -sf vocotype.so libvocotype.so 2>/dev/null || true
+if [ -d "$HOME/.local/lib64/fcitx5" ]; then
+    cd "$HOME/.local/lib64/fcitx5" && ln -sf vocotype.so libvocotype.so
+fi
+if [ -d "$HOME/.local/lib/fcitx5" ]; then
+    cd "$HOME/.local/lib/fcitx5" && ln -sf vocotype.so libvocotype.so
+fi
 
 # 安装 Addon 配置文件
 mkdir -p "$HOME/.local/share/fcitx5/addon"
@@ -270,13 +274,15 @@ if command -v uv &>/dev/null; then
     echo "使用 uv 安装依赖..."
     cd "$PROJECT_DIR"
     uv pip install -r requirements.txt --python "$VENV_PYTHON"
-    uv pip install -e ".[full]" --python "$VENV_PYTHON"
+    uv pip install pyrime --python "$VENV_PYTHON"
+    uv pip install -e . --no-deps --python "$VENV_PYTHON"
 else
     echo "使用 pip 安装依赖..."
     "$VENV_PYTHON" -m pip install --upgrade pip
     "$VENV_PYTHON" -m pip install -r "$PROJECT_DIR/requirements.txt"
     cd "$PROJECT_DIR"
-    "$VENV_PYTHON" -m pip install -e ".[full]"
+    "$VENV_PYTHON" -m pip install pyrime
+    "$VENV_PYTHON" -m pip install -e . --no-deps
 fi
 
 echo "✓ Python 环境已配置"
@@ -588,7 +594,7 @@ echo "     fcitx5-configtool"
 echo "   （在输入法列表中找到 VoCoType，添加到当前输入法）"
 echo ""
 echo "5. 使用方法："
-echo "   - 按住 F9 说话，松开识别（语音输入）"
+echo "   - 按住 F9 或 RightAlt 说话，松开识别（语音输入）"
 echo "   - 正常打字使用 Rime 拼音输入"
 echo ""
 echo "🎤 享受语音 + 拼音的输入体验！"

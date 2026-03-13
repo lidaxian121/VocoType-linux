@@ -128,6 +128,7 @@ RimeUIState IPCClient::processKey(int keyval, int mask) {
         json response = json::parse(response_str);
 
         state.handled = response.value("handled", false);
+        state.ascii_mode = response.value("ascii_mode", false);
 
         // 提交文本
         if (response.contains("commit")) {

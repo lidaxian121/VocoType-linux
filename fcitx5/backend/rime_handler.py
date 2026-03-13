@@ -20,6 +20,9 @@ class RimeHandler:
     """Rime 按键处理器"""
 
     DEFAULT_RIME_SCHEMA = "luna_pinyin"
+    RELEASE_MASK = 1 << 30
+    SHIFT_MASK = 1 << 0
+    SHIFT_L_KEYVAL = 65505
 
     def __init__(self):
         self.session: Optional[RimeSession] = None
@@ -27,6 +30,9 @@ class RimeHandler:
         self._session_id = None
         self.available = self._check_rime_available()
         self._init_lock = threading.Lock()
+        self._ascii_mode = False
+        self._shift_l_pressed = False
+        self._shift_l_used = False
 
         if self.available:
             logger.info("Rime 处理器已创建（pyrime 可用）")
@@ -78,12 +84,17 @@ class RimeHandler:
         return None
 
     def _get_preferred_rime_schema(self, user_data_dir: Path) -> Optional[str]:
-        """优先读取 vocotype 的 user.yaml，失败再回退 user_data_dir"""
-        vocotype_yaml = Path.home() / ".config" / "vocotype" / "rime" / "user.yaml"
-        preferred = self._read_schema_from_yaml(vocotype_yaml)
+        """读取用户偏好方案。
+
+        优先尊重 fcitx5-rime 当前用户目录中的 user.yaml，
+        仅在缺失时才回退到 VoCoType 安装脚本记录的 user.yaml。
+        """
+        preferred = self._read_schema_from_yaml(user_data_dir / "user.yaml")
         if preferred:
             return preferred
-        return self._read_schema_from_yaml(user_data_dir / "user.yaml")
+
+        vocotype_yaml = Path.home() / ".config" / "vocotype" / "rime" / "user.yaml"
+        return self._read_schema_from_yaml(vocotype_yaml)
 
     def _read_installation_metadata(self, user_data_dir: Path) -> dict:
         """读取 Rime installation.yaml 中的 distribution 信息"""
@@ -139,7 +150,9 @@ class RimeHandler:
             session = None
             try:
                 # 确保日志目录存在
-                log_dir = Path.home() / ".local" / "share" / "vocotype-fcitx5" / "rime"
+                # 使用独立的日志目录，避免旧版本误写入的 user.yaml/build
+                # 继续干扰当前 schema 选择。
+                log_dir = Path.home() / ".local" / "share" / "vocotype-fcitx5" / "logs" / "rime"
                 log_dir.mkdir(parents=True, exist_ok=True)
 
                 from pyrime.api import Traits, API
@@ -185,14 +198,10 @@ class RimeHandler:
                 distribution_version = install_meta.get("distribution_version") or "1.0"
                 app_name = "rime.fcitx5" if distribution_code == "fcitx-rime" else "rime.vocotype.fcitx5"
 
-                # 注意：pyrime 编译版本中 user_data_dir 和 log_dir 字段位置与 .pyi 存根相反。
-                # 实测：传入 user_data_dir 的值被 librime 用作 log_dir，
-                #       传入 log_dir 的值被 librime 用作 user_data_dir（读取 schema/build）。
-                # 因此这里交换两个字段，使 librime 能正确读取用户配置目录中的 schema 和 build。
                 traits = Traits(
                     shared_data_dir=str(shared_data_dir),
-                    user_data_dir=str(log_dir),      # pyrime bug: 此值实为 librime log_dir
-                    log_dir=str(user_data_dir),       # pyrime bug: 此值实为 librime user_data_dir
+                    user_data_dir=str(user_data_dir),
+                    log_dir=str(log_dir),
                     distribution_name=distribution_name,
                     distribution_code_name=distribution_code,
                     distribution_version=distribution_version,
@@ -223,24 +232,34 @@ class RimeHandler:
                     logger.warning("获取当前schema失败: %s，使用默认值", exc)
                     schema = None
 
-                preferred_schema = self._get_preferred_rime_schema(user_data_dir)
-                if preferred_schema:
-                    try:
-                        logger.info("尝试使用用户配置的方案: %s", preferred_schema)
-                        session.select_schema(preferred_schema)
-                    except Exception as exc:
-                        logger.warning("选择用户方案失败: %s", exc)
-                elif schema in (None, "", ".default"):
-                    try:
-                        logger.info("使用默认方案: %s", self.DEFAULT_RIME_SCHEMA)
-                        session.select_schema(self.DEFAULT_RIME_SCHEMA)
-                    except Exception as exc:
-                        logger.warning("选择默认方案失败: %s", exc)
+                current_schema = schema if schema not in (None, "", ".default") else None
+                if current_schema:
+                    logger.info("保留当前会话方案: %s", current_schema)
+                else:
+                    preferred_schema = self._get_preferred_rime_schema(user_data_dir)
+                    if preferred_schema:
+                        try:
+                            logger.info("尝试使用用户配置的方案: %s", preferred_schema)
+                            session.select_schema(preferred_schema)
+                        except Exception as exc:
+                            logger.warning("选择用户方案失败: %s", exc)
+                    else:
+                        try:
+                            logger.info("使用默认方案: %s", self.DEFAULT_RIME_SCHEMA)
+                            session.select_schema(self.DEFAULT_RIME_SCHEMA)
+                        except Exception as exc:
+                            logger.warning("选择默认方案失败: %s", exc)
 
-                try:
-                    logger.info("当前 schema: %s", session.get_current_schema())
-                except Exception:
-                    pass
+                if not current_schema and schema in (None, "", ".default"):
+                    try:
+                        logger.info("当前 schema: %s", session.get_current_schema())
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        logger.info("当前 schema: %s", session.get_current_schema())
+                    except Exception:
+                        pass
 
                 try:
                     if hasattr(session, "set_option"):
@@ -293,19 +312,50 @@ class RimeHandler:
         logger.info("process_key: keyval=%d, mask=%d, available=%s, session=%s",
                     keyval, mask, self.available, self.session is not None)
 
+        is_release = bool(mask & self.RELEASE_MASK)
+        base_mask = mask & ~self.RELEASE_MASK
+
+        # 在 VoCoType 内部显式模拟 Shift_L 点按切中英文。
+        # 这样可以和 Fcitx 的全局 Ctrl+Space 切换共存，也避免依赖
+        # pyrime 对 Shift 点按语义的不完整封装。
+        if keyval == self.SHIFT_L_KEYVAL:
+            if not is_release:
+                self._shift_l_pressed = True
+                self._shift_l_used = False
+                return {"handled": False, "ascii_mode": self._ascii_mode}
+
+            should_toggle = self._shift_l_pressed and not self._shift_l_used
+            self._shift_l_pressed = False
+            self._shift_l_used = False
+            if should_toggle:
+                self._ascii_mode = not self._ascii_mode
+                self.reset()
+                logger.info("VoCoType ASCII 模式切换: %s", self._ascii_mode)
+                return {"handled": True, "ascii_mode": self._ascii_mode}
+            return {"handled": False, "ascii_mode": self._ascii_mode}
+
+        if is_release:
+            return {"handled": False, "ascii_mode": self._ascii_mode}
+
         if not self.available:
             logger.warning("Rime not available (pyrime not installed)")
-            return {"handled": False}
+            return {"handled": False, "ascii_mode": self._ascii_mode}
 
         if not self.initialize():
             logger.warning("Rime initialization failed")
-            return {"handled": False}
+            return {"handled": False, "ascii_mode": self._ascii_mode}
 
         try:
-            # 处理按键
-            handled = self.session.process_key(keyval, mask)
+            if self._shift_l_pressed and not is_release:
+                self._shift_l_used = True
 
-            result = {"handled": handled}
+            if self._ascii_mode:
+                return {"handled": False, "ascii_mode": self._ascii_mode}
+
+            # 处理按键
+            handled = self.session.process_key(keyval, base_mask)
+
+            result = {"handled": handled, "ascii_mode": self._ascii_mode}
 
             # 检查提交文本
             commit = self.session.get_commit()
@@ -316,6 +366,14 @@ class RimeHandler:
             # 获取上下文
             context = self.session.get_context()
             if context:
+                composition = getattr(context, "composition", None)
+                preedit = getattr(composition, "preedit", None)
+                if preedit:
+                    result["preedit"] = {
+                        "text": preedit,
+                        "cursor_pos": getattr(composition, "cursor_pos", 0),
+                    }
+
                 # 候选词
                 menu = getattr(context, "menu", None)
                 candidates = getattr(menu, "candidates", None) or []
@@ -344,10 +402,12 @@ class RimeHandler:
             logger.error("Rime 处理按键失败: %s", exc)
             import traceback
             traceback.print_exc()
-            return {"handled": False}
+            return {"handled": False, "ascii_mode": self._ascii_mode}
 
     def reset(self):
         """重置 Rime 状态（清除组合）"""
+        self._shift_l_pressed = False
+        self._shift_l_used = False
         if self.session:
             try:
                 self.session.clear_composition()

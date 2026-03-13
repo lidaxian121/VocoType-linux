@@ -25,6 +25,14 @@
 
 namespace {
 
+fcitx::KeyList defaultPTTKeys() {
+    return {
+        fcitx::Key(FcitxKey_F9),
+        fcitx::Key(FcitxKey_Alt_R),
+        fcitx::Key(FcitxKey_ISO_Level3_Shift),
+    };
+}
+
 std::string stopRecorderProcess(pid_t pid, int stdin_fd, FILE* stdout_file) {
     if (stdin_fd >= 0) {
         close(stdin_fd);
@@ -56,12 +64,11 @@ std::string stopRecorderProcess(pid_t pid, int stdin_fd, FILE* stdout_file) {
 
 namespace vocotype {
 
-// F9 键
-constexpr int PTT_KEYVAL = FcitxKey_F9;
-
 VoCoTypeAddon::VoCoTypeAddon(fcitx::Instance* instance)
     : instance_(instance),
+      ptt_keys_(defaultPTTKeys()),
       ipc_client_(std::make_unique<IPCClient>("/tmp/vocotype-fcitx5.sock")) {
+    main_thread_dispatcher_.attach(&instance_->eventLoop());
 
     // 获取安装路径
     const char* home = std::getenv("HOME");
@@ -73,6 +80,9 @@ VoCoTypeAddon::VoCoTypeAddon(fcitx::Instance* instance)
     }
 
     FCITX_INFO() << "VoCoType Addon initialized";
+    FCITX_INFO() << "PTT keys: "
+                 << fcitx::Key::keyListToString(
+                        ptt_keys_, fcitx::KeyStringFormat::Portable);
 
     // 测试 Backend 连接
     if (ipc_client_->ping()) {
@@ -94,6 +104,7 @@ VoCoTypeAddon::~VoCoTypeAddon() {
         recorder_stdout_ = nullptr;
         is_recording_ = false;
     }
+    main_thread_dispatcher_.detach();
     FCITX_INFO() << "VoCoType Addon destroyed";
 }
 
@@ -102,8 +113,8 @@ std::vector<fcitx::InputMethodEntry> VoCoTypeAddon::listInputMethods() {
 
     auto entry = fcitx::InputMethodEntry("vocotype", "VoCoType", "zh_CN", "vocotype");
     entry.setNativeName("语音输入");
-    entry.setIcon("microphone");
-    entry.setLabel("🎤");
+    entry.setIcon("audio-input-microphone");
+    entry.setLabel("V");
 
     result.push_back(std::move(entry));
     return result;
@@ -115,22 +126,23 @@ void VoCoTypeAddon::keyEvent(const fcitx::InputMethodEntry& entry,
 
     // 获取按键信息
     auto key = keyEvent.key();
-    int keyval = key.sym();
     bool is_release = keyEvent.isRelease();
 
-    FCITX_DEBUG() << "Key event: keyval=" << keyval
+    FCITX_DEBUG() << "Key event: key=" << key.toString()
                   << ", release=" << is_release
-                  << ", F9=" << PTT_KEYVAL;
+                  << ", ptt_keys="
+                  << fcitx::Key::keyListToString(
+                         ptt_keys_, fcitx::KeyStringFormat::Portable);
 
-    // 处理 F9 键（PTT）
-    if (keyval == PTT_KEYVAL) {
+    // 处理 PTT 键（按住说话，松开识别）
+    if (isPTTKey(key, is_release)) {
         if (is_release) {
-            // F9 松开：停止录音并转录
+            // 松开 PTT 键：停止录音并转录
             if (is_recording_) {
                 stopAndTranscribe(ic);
             }
         } else {
-            // F9 按下：开始录音
+            // 按下 PTT 键：开始录音
             if (!is_recording_) {
                 startRecording(ic);
             }
@@ -139,49 +151,66 @@ void VoCoTypeAddon::keyEvent(const fcitx::InputMethodEntry& entry,
         return;
     }
 
-    // 其他键：转发给 Rime
-    if (!is_release) {
-        // 跳过输入法切换热键
-        if (isIMSwitchHotkey(key)) {
+    int keyval = key.sym();
+
+    // 跳过输入法切换热键
+    if (isIMSwitchHotkey(key, is_release)) {
+        return;
+    }
+
+    // 普通字符键只转发按下事件；修饰键保留按下/松开，
+    // 避免普通键的 release 被 Rime 再次解释，导致拼音重复。
+    if (is_release && !key.isModifier()) {
+        return;
+    }
+
+    // 构建 Rime modifier mask
+    int mask = 0;
+    if (key.states() & fcitx::KeyState::Shift) {
+        mask |= (1 << 0);  // kShiftMask
+    }
+    if (key.states() & fcitx::KeyState::CapsLock) {
+        mask |= (1 << 1);  // kLockMask
+    }
+    if (key.states() & fcitx::KeyState::Ctrl) {
+        mask |= (1 << 2);  // kControlMask
+    }
+    if (key.states() & fcitx::KeyState::Alt) {
+        mask |= (1 << 3);  // kAltMask
+    }
+    if (is_release) {
+        mask |= (1 << 30);  // kReleaseMask
+    }
+
+    // 调用 IPC
+    try {
+        const bool old_ascii_mode = ascii_mode_;
+        RimeUIState state = ipc_client_->processKey(keyval, mask);
+        ascii_mode_ = state.ascii_mode;
+
+        // 如果有提交文本，先提交
+        if (!state.commit_text.empty()) {
+            commitText(ic, state.commit_text);
+        }
+
+        // 更新 UI
+        updateUI(ic, state);
+
+        // 如果被 Rime 处理，则拦截此按键
+        if (state.handled) {
+            if (ascii_mode_ != old_ascii_mode) {
+                updateStatusIndicator(ic);
+            }
+            keyEvent.filterAndAccept();
             return;
         }
 
-        // 构建 Rime modifier mask
-        int mask = 0;
-        if (key.states() & fcitx::KeyState::Shift) {
-            mask |= (1 << 0);  // kShiftMask
-        }
-        if (key.states() & fcitx::KeyState::CapsLock) {
-            mask |= (1 << 1);  // kLockMask
-        }
-        if (key.states() & fcitx::KeyState::Ctrl) {
-            mask |= (1 << 2);  // kControlMask
-        }
-        if (key.states() & fcitx::KeyState::Alt) {
-            mask |= (1 << 3);  // kAltMask
+        if (ascii_mode_ != old_ascii_mode) {
+            updateStatusIndicator(ic);
         }
 
-        // 调用 IPC
-        try {
-            RimeUIState state = ipc_client_->processKey(keyval, mask);
-
-            // 如果有提交文本，先提交
-            if (!state.commit_text.empty()) {
-                commitText(ic, state.commit_text);
-            }
-
-            // 更新 UI
-            updateUI(ic, state);
-
-            // 如果被 Rime 处理，则拦截此按键
-            if (state.handled) {
-                keyEvent.filterAndAccept();
-                return;
-            }
-
-        } catch (const std::exception& e) {
-            FCITX_ERROR() << "Rime key processing failed: " << e.what();
-        }
+    } catch (const std::exception& e) {
+        FCITX_ERROR() << "Rime key processing failed: " << e.what();
     }
 }
 
@@ -195,6 +224,7 @@ void VoCoTypeAddon::reset(const fcitx::InputMethodEntry& entry,
 void VoCoTypeAddon::activate(const fcitx::InputMethodEntry& entry,
                               fcitx::InputContextEvent& event) {
     FCITX_DEBUG() << "VoCoType activated";
+    updateStatusIndicator(event.inputContext());
 }
 
 void VoCoTypeAddon::deactivate(const fcitx::InputMethodEntry& entry,
@@ -326,13 +356,12 @@ void VoCoTypeAddon::stopRecording(fcitx::InputContext* ic, bool transcribe) {
         std::string audio_path = stopRecorderProcess(pid, stdin_fd, stdout_file);
         if (audio_path.empty()) {
             if (transcribe) {
-                instance_->eventDispatcher().scheduleWithContext(
-                    ic_ref, [this, ic_ref]() {
-                        auto* ic_ptr = ic_ref.get();
-                        if (ic_ptr) {
-                            showError(ic_ptr, "录音失败");
-                        }
-                    });
+                main_thread_dispatcher_.schedule([this, ic_ref]() {
+                    auto* ic_ptr = ic_ref.get();
+                    if (ic_ptr) {
+                        showError(ic_ptr, "录音失败");
+                    }
+                });
             }
             return;
         }
@@ -345,38 +374,56 @@ void VoCoTypeAddon::stopRecording(fcitx::InputContext* ic, bool transcribe) {
         TranscribeResult result = ipc_client_->transcribeAudio(audio_path);
         std::remove(audio_path.c_str());
 
-        instance_->eventDispatcher().scheduleWithContext(
-            ic_ref, [this, ic_ref, result]() {
-                auto* ic_ptr = ic_ref.get();
-                if (!ic_ptr) {
-                    return;
-                }
-                if (result.success && !result.text.empty()) {
-                    commitText(ic_ptr, result.text);
-                } else if (!result.success) {
-                    showError(ic_ptr,
-                              result.error.empty() ? "转录失败" : result.error);
-                } else {
-                    clearUI(ic_ptr);
-                }
-            });
+        main_thread_dispatcher_.schedule([this, ic_ref, result]() {
+            auto* ic_ptr = ic_ref.get();
+            if (!ic_ptr) {
+                return;
+            }
+            if (result.success && !result.text.empty()) {
+                commitText(ic_ptr, result.text);
+            } else if (!result.success) {
+                showError(ic_ptr,
+                          result.error.empty() ? "转录失败" : result.error);
+            } else {
+                clearUI(ic_ptr);
+            }
+        });
     }).detach();
 
     FCITX_INFO() << "Recording stopped";
 }
 
+bool VoCoTypeAddon::isPTTKey(const fcitx::Key& key, bool is_release) const {
+    const auto normalized_key = key.normalize();
+
+    for (const auto& ptt_key : ptt_keys_) {
+        const auto normalized_ptt_key = ptt_key.normalize();
+        if (key.check(ptt_key) || normalized_key.check(normalized_ptt_key)) {
+            return true;
+        }
+        if (is_release &&
+            (key.isReleaseOfModifier(ptt_key) ||
+             normalized_key.isReleaseOfModifier(normalized_ptt_key))) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void VoCoTypeAddon::updateUI(fcitx::InputContext* ic, const RimeUIState& state) {
     auto& inputPanel = ic->inputPanel();
 
-    // 更新预编辑
+    // 在经典 UI 中，preedit 应该显示在输入法面板上，而不是依赖
+    // client preedit（后者更偏向应用内预编辑）。
     if (!state.preedit_text.empty()) {
         fcitx::Text preedit;
         preedit.append(state.preedit_text, fcitx::TextFormatFlag::Underline);
-        inputPanel.setClientPreedit(preedit);
-        // 注意：Fcitx5 的 InputPanel 可能没有直接的 setCursor 方法
-        // 光标位置通常通过 preedit 的属性设置
+        inputPanel.setPreedit(preedit);
+        inputPanel.setClientPreedit(fcitx::Text());
         ic->updatePreedit();
     } else {
+        inputPanel.setPreedit(fcitx::Text());
         inputPanel.setClientPreedit(fcitx::Text());
         ic->updatePreedit();
     }
@@ -400,10 +447,6 @@ void VoCoTypeAddon::updateUI(fcitx::InputContext* ic, const RimeUIState& state) 
             const auto& [text, comment] = state.candidates[i];
             fcitx::Text candidate_text;
             candidate_text.append(text);
-            if (!comment.empty()) {
-                candidate_text.append(" ");
-                candidate_text.append(comment);
-            }
             candidateList->append<fcitx::DisplayOnlyCandidateWord>(candidate_text);
         }
 
@@ -446,25 +489,55 @@ void VoCoTypeAddon::showError(fcitx::InputContext* ic, const std::string& error)
     // 2 秒自动清除在 Fcitx5 中需要更复杂的实现
 }
 
-bool VoCoTypeAddon::isIMSwitchHotkey(const fcitx::Key& key) const {
-    // 只拦截 Super+Space (输入法切换)，不拦截 Ctrl+Space (中英切换)
-    if (key.sym() == FcitxKey_space) {
-        if (key.states() & fcitx::KeyState::Super) {
-            return true;
-        }
+void VoCoTypeAddon::updateStatusIndicator(fcitx::InputContext* ic) {
+    if (!ic) {
+        return;
     }
+    ic->updateUserInterface(fcitx::UserInterfaceComponent::StatusArea);
+}
 
-    // Ctrl+Shift 或 Alt+Shift
-    if (key.sym() == FcitxKey_Shift_L || key.sym() == FcitxKey_Shift_R) {
-        if (key.states() & fcitx::KeyState::Ctrl) {
-            return true;
-        }
-        if (key.states() & fcitx::KeyState::Alt) {
-            return true;
-        }
-    }
+std::string VoCoTypeAddon::subModeIconImpl(const fcitx::InputMethodEntry& entry,
+                                           fcitx::InputContext& inputContext) {
+    FCITX_UNUSED(entry);
+    FCITX_UNUSED(inputContext);
+    return ascii_mode_ ? "input-keyboard" : "audio-input-microphone";
+}
 
-    return false;
+std::string VoCoTypeAddon::subModeLabelImpl(const fcitx::InputMethodEntry& entry,
+                                            fcitx::InputContext& inputContext) {
+    FCITX_UNUSED(entry);
+    FCITX_UNUSED(inputContext);
+    return ascii_mode_ ? "A" : "中";
+}
+
+bool VoCoTypeAddon::isIMSwitchHotkey(const fcitx::Key& key, bool is_release) const {
+    const auto normalized_key = key.normalize();
+    const auto& config = instance_->globalConfig();
+
+    auto matches_key_list = [&](const fcitx::KeyList& keys) {
+        for (const auto& configured_key : keys) {
+            const auto normalized_configured_key = configured_key.normalize();
+            if (key.check(configured_key) ||
+                normalized_key.check(normalized_configured_key)) {
+                return true;
+            }
+            if (is_release &&
+                (key.isReleaseOfModifier(configured_key) ||
+                 normalized_key.isReleaseOfModifier(normalized_configured_key))) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    return matches_key_list(config.triggerKeys()) ||
+           matches_key_list(config.altTriggerKeys()) ||
+           matches_key_list(config.enumerateForwardKeys()) ||
+           matches_key_list(config.enumerateBackwardKeys()) ||
+           matches_key_list(config.enumerateGroupForwardKeys()) ||
+           matches_key_list(config.enumerateGroupBackwardKeys()) ||
+           matches_key_list(config.activateKeys()) ||
+           matches_key_list(config.deactivateKeys());
 }
 
 } // namespace vocotype
