@@ -322,7 +322,9 @@ class RimeHandler:
             if not is_release:
                 self._shift_l_pressed = True
                 self._shift_l_used = False
-                return {"handled": False, "ascii_mode": self._ascii_mode}
+                # 吞掉 Shift_L 的按下事件，避免浏览器/应用提前收到一个
+                # “真实的 Shift 修饰键按下”，导致下一键被当成大写处理。
+                return {"handled": True, "ascii_mode": self._ascii_mode}
 
             should_toggle = self._shift_l_pressed and not self._shift_l_used
             self._shift_l_pressed = False
@@ -332,7 +334,9 @@ class RimeHandler:
                 self.reset()
                 logger.info("VoCoType ASCII 模式切换: %s", self._ascii_mode)
                 return {"handled": True, "ascii_mode": self._ascii_mode}
-            return {"handled": False, "ascii_mode": self._ascii_mode}
+            # Shift_L 的松开事件同样不应该泄露给应用；即使它不是一次
+            # “点按切换”，我们也已经消费了对应的按下事件。
+            return {"handled": True, "ascii_mode": self._ascii_mode}
 
         if is_release:
             return {"handled": False, "ascii_mode": self._ascii_mode}
